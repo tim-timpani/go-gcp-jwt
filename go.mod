@@ -1,4 +1,4 @@
-module github.com/tim-timpani/go-gcp-jwt
+module github.com/tim-timpani/go-gcp-jwt v1.1.0
 
 go 1.20
 

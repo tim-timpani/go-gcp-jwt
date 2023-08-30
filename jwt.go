@@ -16,6 +16,104 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	defaultMinTokenLifetime = 30
+	defaultMaxTokenLifetime = 3600
+)
+
+type GcpTokenGenerator struct {
+	header             *ClaimHeader
+	payload            *ClaimBody
+	key                *rsa.PrivateKey
+	token              string
+	MaxLifetimeSeconds uint64
+	MinLifetimeSeconds uint64
+}
+
+// GetJWTFromServiceFile - main convenience function to generate a new JWT
+func NewGcpTokenGenerator(fileName string, audienceUrl string) (*GcpTokenGenerator, error) {
+	var err error
+	var sa *GcpServiceAccount
+	g := &GcpTokenGenerator{
+		MaxLifetimeSeconds: defaultMaxTokenLifetime,
+		MinLifetimeSeconds: defaultMinTokenLifetime,
+	}
+
+	if sa, err = NewServiceAccount(fileName); err != nil {
+		return nil, err
+	}
+
+	g.header = &ClaimHeader{
+		Alg: "RS256",
+		Typ: "JWT",
+		Kid: sa.PrivateKeyId,
+	}
+
+	g.payload = &ClaimBody{
+		Iss: sa.ClientEmail,
+		Sub: sa.ClientEmail,
+		Aud: audienceUrl,
+	}
+
+	if g.key, err = sa.getPrivateKey(); err != nil {
+		return nil, err
+	}
+
+	return g, nil
+}
+
+func (g *GcpTokenGenerator) GetToken() (string, error) {
+	if !g.tokenOk() {
+		if err := g.refreshToken(); err != nil {
+			return "", err
+		}
+	}
+	return g.token, nil
+}
+
+func (g *GcpTokenGenerator) tokenOk() bool {
+	if g.token == "" {
+		return false
+	}
+	if g.payload.Exp-uint64(time.Now().Unix()) < g.MinLifetimeSeconds {
+		return false
+	}
+	return true
+}
+
+func (g *GcpTokenGenerator) refreshToken() error {
+	var err error
+	var encodedHeader string
+	var encodedPayload string
+	var sig []byte
+
+	now := uint64(time.Now().Unix())
+	g.payload.Iat = now
+	g.payload.Exp = now + g.MaxLifetimeSeconds
+
+	if encodedHeader, err = encodeStruct(g.header); err != nil {
+		return err
+	}
+	if encodedPayload, err = encodeStruct(g.payload); err != nil {
+		return err
+	}
+
+	// sign the hash with the private key
+	claim := encodedHeader + "." + encodedPayload
+	hashedClaim := sha256.Sum256([]byte(claim))
+
+	if sig, err = g.key.Sign(rand.Reader, hashedClaim[:], crypto.SHA256); err != nil {
+		log.Errorf("failed to sign token: %v", err)
+		return err
+	}
+
+	// append the base64 encoded signature to the claim to complete the JWT
+	g.token = claim + "." + base64.StdEncoding.EncodeToString(sig)
+
+	return nil
+
+}
+
 type GcpServiceAccount struct {
 	Type                    string `json:"type"`
 	ProjectId               string `json:"project_id"`
@@ -45,9 +143,11 @@ func NewServiceAccount(fileName string) (g *GcpServiceAccount, err error) {
 	return
 }
 
+/*
 // NewJWT - main struct method to generate the JWT:  audienceUrl should be set to the base URL for API calls or
 // the value of 'x-google-audience' if specified in the OpenAPI document.
 func (g *GcpServiceAccount) NewJWT(audienceUrl string, expiry time.Duration) (token string, err error) {
+
 	var body string
 	var header string
 	var key *rsa.PrivateKey
@@ -94,6 +194,7 @@ func (g *GcpServiceAccount) NewJWT(audienceUrl string, expiry time.Duration) (to
 
 	return
 }
+*/
 
 // getPrivateKey - create the *rsa.PrivateKey reference from the pem
 func (g *GcpServiceAccount) getPrivateKey() (key *rsa.PrivateKey, err error) {
@@ -120,12 +221,12 @@ func (g *GcpServiceAccount) getPrivateKey() (key *rsa.PrivateKey, err error) {
 }
 
 // GetJWTFromServiceFile - main convenience function to generate a new JWT
-func GetJWTFromServiceFile(fileName string, audienceUrl string, tokenExpiry time.Duration) (jwt string, err error) {
-	var sa *GcpServiceAccount
-	if sa, err = NewServiceAccount(fileName); err != nil {
+func GetJWTFromServiceFile(fileName string, audienceUrl string) (jwt string, err error) {
+	var gen *GcpTokenGenerator
+	if gen, err = NewGcpTokenGenerator(fileName, audienceUrl); err != nil {
 		return
 	}
-	return sa.NewJWT(audienceUrl, tokenExpiry)
+	return gen.GetToken()
 }
 
 type ClaimHeader struct {
@@ -138,8 +239,8 @@ type ClaimBody struct {
 	Iss string `json:"iss"`
 	Sub string `json:"sub"`
 	Aud string `json:"aud"`
-	Exp int64  `json:"exp"`
-	Iat int64  `json:"iat"`
+	Exp uint64 `json:"exp"`
+	Iat uint64 `json:"iat"`
 }
 
 // encodeStruct - returns base64 JSON of exported struct fields with JSON tags
